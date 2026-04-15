@@ -379,6 +379,220 @@ class FullHunt(BaseSource):
 
 
 # ---------------------------------------------------------------------------
+# Additional Free Sources (added for maximum coverage)
+# ---------------------------------------------------------------------------
+
+class SubdomainCenter(BaseSource):
+    """subdomain.center API."""
+    name = "SubdomainCenter"
+    timeout = 30
+
+    async def enumerate(self) -> Set[str]:
+        url = f"https://api.subdomain.center/?domain={self.domain}"
+        data = await self._get_json(url)
+        if data and isinstance(data, list):
+            for sub in data:
+                sub = sub.strip().lower().lstrip("*.")
+                if sub.endswith(self.domain):
+                    self.results.add(sub)
+        return self.results
+
+
+class Columbus(BaseSource):
+    """columbus.elmasy.com API."""
+    name = "Columbus"
+    timeout = 30
+
+    async def enumerate(self) -> Set[str]:
+        url = f"https://columbus.elmasy.com/api/lookup/{self.domain}?days=365"
+        data = await self._get_json(url)
+        if data and isinstance(data, list):
+            for entry in data:
+                sub = entry if isinstance(entry, str) else entry.get("subdomain", "")
+                sub = sub.strip().lower().lstrip("*.")
+                if sub and sub.endswith(self.domain):
+                    self.results.add(sub)
+                elif sub and not sub.startswith("."):
+                    # Columbus returns just the prefix sometimes
+                    full = f"{sub}.{self.domain}"
+                    self.results.add(full)
+        return self.results
+
+
+class InternetDB(BaseSource):
+    """Shodan InternetDB — free, no key required. Reverse lookup on known IPs."""
+    name = "InternetDB"
+    timeout = 30
+
+    async def enumerate(self) -> Set[str]:
+        # First resolve the domain to get IPs, then look up hostnames
+        try:
+            import dns.resolver
+            answers = dns.resolver.resolve(self.domain, "A")
+            ips = [rdata.address for rdata in answers]
+        except Exception:
+            return self.results
+        for ip in ips[:5]:
+            url = f"https://internetdb.shodan.io/{ip}"
+            data = await self._get_json(url)
+            if data:
+                for hostname in data.get("hostnames", []):
+                    hostname = hostname.strip().lower()
+                    if hostname.endswith(self.domain):
+                        self.results.add(hostname)
+        return self.results
+
+
+class CrtShPaginated(BaseSource):
+    """crt.sh with deduplication and identity search for extra coverage."""
+    name = "crt.sh (identity)"
+    timeout = 90
+
+    async def enumerate(self) -> Set[str]:
+        # Search by organization identity, catches certs missed by wildcard search
+        url = f"https://crt.sh/?q=%.{self.domain}&output=json&deduplicate=Y"
+        data = await self._get_json(url)
+        if data:
+            for entry in data:
+                name_value = entry.get("name_value", "")
+                for line in name_value.split("\n"):
+                    line = line.strip().lower().lstrip("*.")
+                    if line.endswith(self.domain):
+                        self.results.add(line)
+                # Also check common_name field
+                cn = entry.get("common_name", "").strip().lower().lstrip("*.")
+                if cn.endswith(self.domain):
+                    self.results.add(cn)
+        return self.results
+
+
+class SiteDossier(BaseSource):
+    """sitedossier.com HTML scraper."""
+    name = "SiteDossier"
+    timeout = 30
+
+    async def enumerate(self) -> Set[str]:
+        page = 1
+        while page <= 10:
+            url = f"http://www.sitedossier.com/parentdomain/{self.domain}/{page}"
+            text = await self._get(url)
+            if not text:
+                break
+            found = self.extract_subdomains(text)
+            if not found:
+                break
+            self.results.update(found)
+            if "Next page" not in text:
+                break
+            page += 1
+        return self.results
+
+
+class Myssl(BaseSource):
+    """myssl.com certificate discovery."""
+    name = "Myssl"
+    timeout = 30
+
+    async def enumerate(self) -> Set[str]:
+        url = f"https://myssl.com/api/v1/discover_sub_domain?domain={self.domain}"
+        data = await self._get_json(url)
+        if data and data.get("code") == 0:
+            for item in data.get("data", []):
+                sub = item.get("domain", "").strip().lower()
+                if sub.endswith(self.domain):
+                    self.results.add(sub)
+        return self.results
+
+
+class Netlas(BaseSource):
+    """netlas.io free certificate search."""
+    name = "Netlas"
+    timeout = 30
+
+    async def enumerate(self) -> Set[str]:
+        url = "https://app.netlas.io/api/domains/"
+        params = {"q": f"domain:*.{self.domain}", "source_type": "include", "start": 0, "count": 200}
+        data = await self._get_json(url, params=params)
+        if data:
+            for item in data.get("items", []):
+                domain_data = item.get("data", {})
+                host = domain_data.get("host", "").strip().lower()
+                if host.endswith(self.domain):
+                    self.results.add(host)
+                # Check last_updated domains
+                domain_val = domain_data.get("domain", "").strip().lower()
+                if domain_val and domain_val.endswith(self.domain):
+                    self.results.add(domain_val)
+        return self.results
+
+
+class DnsBufOverRun(BaseSource):
+    """tls.bufferover.run — DNS+TLS combined search."""
+    name = "BufferOver-TLS"
+    timeout = 30
+
+    async def enumerate(self) -> Set[str]:
+        url = f"https://tls.bufferover.run/dns?q=.{self.domain}"
+        data = await self._get_json(url)
+        if data:
+            for record in data.get("Results", []):
+                parts = record.split(",")
+                for part in parts:
+                    part = part.strip().lower()
+                    if part.endswith(self.domain):
+                        self.results.add(part)
+            # Also check FDNS results
+            for record in data.get("FDNS_A", []):
+                parts = record.split(",")
+                if len(parts) >= 2:
+                    host = parts[1].strip().lower()
+                    if host.endswith(self.domain):
+                        self.results.add(host)
+            for record in data.get("RDNS", []):
+                parts = record.split(",")
+                if len(parts) >= 2:
+                    host = parts[1].strip().lower()
+                    if host.endswith(self.domain):
+                        self.results.add(host)
+        return self.results
+
+
+class Leakix(BaseSource):
+    """leakix.net — free subdomain search from leak databases."""
+    name = "Leakix"
+    timeout = 30
+
+    async def enumerate(self) -> Set[str]:
+        url = f"https://leakix.net/api/subdomains/{self.domain}"
+        headers = {"Accept": "application/json"}
+        data = await self._get_json(url, headers=headers)
+        if data and isinstance(data, list):
+            for entry in data:
+                sub = entry.get("subdomain", "") if isinstance(entry, dict) else str(entry)
+                sub = sub.strip().lower()
+                if sub.endswith(self.domain):
+                    self.results.add(sub)
+        return self.results
+
+
+class Racent(BaseSource):
+    """racent.com certificate search."""
+    name = "Racent"
+    timeout = 30
+
+    async def enumerate(self) -> Set[str]:
+        url = f"https://face.racent.com/tool/query_ctlog?keyword={self.domain}"
+        data = await self._get_json(url)
+        if data and isinstance(data, dict):
+            for item in data.get("data", []):
+                name = item.get("domain", "") if isinstance(item, dict) else ""
+                name = name.strip().lower().lstrip("*.")
+                if name.endswith(self.domain):
+                    self.results.add(name)
+        return self.results
+
+
+# ---------------------------------------------------------------------------
 # API-Key Sources (optional)
 # ---------------------------------------------------------------------------
 
@@ -522,14 +736,90 @@ class ChaosProjectDiscovery(BaseSource):
         return self.results
 
 
+class Bevigil(BaseSource):
+    """Bevigil OSINT API (requires API key). Finds subdomains from mobile apps."""
+    name = "Bevigil"
+
+    def __init__(self, domain, session, api_key: str = None):
+        super().__init__(domain, session)
+        self.api_key = api_key
+
+    async def enumerate(self) -> Set[str]:
+        if not self.api_key:
+            return self.results
+        url = f"https://osint.bevigil.com/api/{self.domain}/subdomains/"
+        headers = {"X-Access-Token": self.api_key}
+        data = await self._get_json(url, headers=headers)
+        if data:
+            for sub in data.get("subdomains", []):
+                sub = sub.strip().lower()
+                if sub.endswith(self.domain):
+                    self.results.add(sub)
+        return self.results
+
+
+class WhoisXMLAPI(BaseSource):
+    """WhoisXML API subdomain lookup (requires API key)."""
+    name = "WhoisXMLAPI"
+
+    def __init__(self, domain, session, api_key: str = None):
+        super().__init__(domain, session)
+        self.api_key = api_key
+
+    async def enumerate(self) -> Set[str]:
+        if not self.api_key:
+            return self.results
+        url = "https://subdomains.whoisxmlapi.com/api/v1"
+        params = {"apiKey": self.api_key, "domainName": self.domain, "outputFormat": "JSON"}
+        data = await self._get_json(url, params=params)
+        if data:
+            for record in data.get("result", {}).get("records", []):
+                sub = record.get("domain", "").strip().lower()
+                if sub.endswith(self.domain):
+                    self.results.add(sub)
+        return self.results
+
+
+class ZoomEye(BaseSource):
+    """ZoomEye API (requires API key)."""
+    name = "ZoomEye"
+
+    def __init__(self, domain, session, api_key: str = None):
+        super().__init__(domain, session)
+        self.api_key = api_key
+
+    async def enumerate(self) -> Set[str]:
+        if not self.api_key:
+            return self.results
+        url = "https://api.zoomeye.org/domain/search"
+        headers = {"API-KEY": self.api_key}
+        params = {"q": self.domain, "type": "1", "page": 1}
+        # Fetch up to 5 pages
+        for page in range(1, 6):
+            params["page"] = page
+            data = await self._get_json(url, headers=headers, params=params)
+            if not data:
+                break
+            records = data.get("list", [])
+            if not records:
+                break
+            for record in records:
+                sub = record.get("name", "").strip().lower()
+                if sub.endswith(self.domain):
+                    self.results.add(sub)
+        return self.results
+
+
 # ---------------------------------------------------------------------------
 # Registry of all sources
 # ---------------------------------------------------------------------------
 
 FREE_SOURCES = [
-    CrtSh, CertSpotter, HackerTarget, AlienVaultOTX, ThreatMiner,
-    AnubisDB, URLScan, RapidDNS, WebArchive, BufferOver,
-    DNSRepo, Shrewdeye, CommonCrawl, Digitorus, Riddler, FullHunt,
+    CrtSh, CrtShPaginated, CertSpotter, HackerTarget, AlienVaultOTX,
+    ThreatMiner, AnubisDB, URLScan, RapidDNS, WebArchive, BufferOver,
+    DnsBufOverRun, DNSRepo, Shrewdeye, CommonCrawl, Digitorus, Riddler,
+    FullHunt, SubdomainCenter, Columbus, InternetDB, SiteDossier, Myssl,
+    Netlas, Leakix, Racent,
 ]
 
 API_SOURCES = {
@@ -539,4 +829,7 @@ API_SOURCES = {
     "censys": Censys,
     "binaryedge": BinaryEdge,
     "chaos": ChaosProjectDiscovery,
+    "bevigil": Bevigil,
+    "whoisxmlapi": WhoisXMLAPI,
+    "zoomeye": ZoomEye,
 }

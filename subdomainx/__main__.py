@@ -63,7 +63,9 @@ class SubdomainX:
             f"[bold white]Brute Force:[/] [green]{'Enabled' if not self.config.no_bruteforce else 'Disabled'}[/]\n"
             f"[bold white]Permutations:[/] [green]{'Enabled' if self.config.permutations else 'Disabled'}[/]\n"
             f"[bold white]Recursive:[/] [green]{'Enabled' if self.config.recursive else 'Disabled'}[/]\n"
-            f"[bold white]HTTP Probe:[/] [green]{'Enabled' if self.config.probe else 'Disabled'}[/]",
+            f"[bold white]HTTP Probe:[/] [green]{'Enabled' if self.config.probe else 'Disabled'}[/]\n"
+            f"[bold white]Takeover Check:[/] [green]{'Enabled' if self.config.probe else 'Disabled'}[/]\n"
+            f"[bold white]Mode:[/] [green]{'DEEP' if getattr(self.config, 'deep', False) else 'Standard'}[/]",
             title="[bold]Configuration[/]",
             border_style="blue"
         ))
@@ -378,7 +380,8 @@ class SubdomainX:
 
         resolver = SubdomainResolver(
             concurrency=min(self.config.concurrency, 100),
-            check_http=self.config.probe
+            check_http=self.config.probe,
+            check_takeover=True
         )
 
         with Progress(
@@ -403,7 +406,10 @@ class SubdomainX:
                 progress.advance(task, len(batch))
 
         alive = sum(1 for info in self.resolved_info.values() if info.is_alive)
+        takeovers = sum(1 for info in self.resolved_info.values() if info.takeover_vulnerable)
         console.print(f"  [bold]→ {alive} alive hosts out of {len(self.all_subdomains)} subdomains[/]")
+        if takeovers:
+            console.print(f"  [bold red]⚠ {takeovers} potential subdomain takeover(s) detected![/]")
 
     def _print_results(self):
         """Print final results."""
@@ -426,20 +432,36 @@ class SubdomainX:
 
         # Detailed results if resolved
         if self.resolved_info:
+            # Takeover alerts first
+            takeover_subs = {sub: info for sub, info in self.resolved_info.items() if info.takeover_vulnerable}
+            if takeover_subs:
+                console.print()
+                console.print(Panel(
+                    "[bold red]SUBDOMAIN TAKEOVER CANDIDATES[/]",
+                    border_style="red"
+                ))
+                for sub in sorted(takeover_subs.keys()):
+                    info = takeover_subs[sub]
+                    console.print(f"  [bold red]⚠ {info.subdomain}[/] → CNAME: {', '.join(info.cnames)} → [yellow]{info.takeover_service}[/]")
+
             table = Table(title="Resolved Subdomains", box=box.SIMPLE, show_lines=False)
             table.add_column("Subdomain", style="cyan", no_wrap=True)
             table.add_column("IPs", style="white")
             table.add_column("Status", style="yellow")
-            table.add_column("Title", style="dim", max_width=40)
+            table.add_column("Tech", style="magenta", max_width=20)
+            table.add_column("Title", style="dim", max_width=35)
 
             for sub in sorted(self.resolved_info.keys()):
                 info = self.resolved_info[sub]
                 if info.is_alive:
+                    style = "bold red" if info.takeover_vulnerable else None
                     table.add_row(
-                        info.subdomain,
+                        ("⚠ " if info.takeover_vulnerable else "") + info.subdomain,
                         ", ".join(info.ips[:3]) if info.ips else (", ".join(info.cnames[:2]) if info.cnames else ""),
                         info.status_str,
+                        ", ".join(info.technologies[:3]) if info.technologies else "",
                         info.title or "",
+                        style=style,
                     )
             console.print(table)
         else:
@@ -463,11 +485,15 @@ class SubdomainX:
                 data["resolved"] = {
                     sub: {
                         "ips": info.ips,
+                        "ipv6s": info.ipv6s,
                         "cnames": info.cnames,
                         "http_status": info.http_status,
                         "https_status": info.https_status,
                         "title": info.title,
                         "server": info.http_server,
+                        "technologies": info.technologies,
+                        "takeover_vulnerable": info.takeover_vulnerable,
+                        "takeover_service": info.takeover_service,
                         "alive": info.is_alive,
                     }
                     for sub, info in sorted(self.resolved_info.items())
@@ -480,17 +506,21 @@ class SubdomainX:
             with open(output_path, "w", newline="") as f:
                 writer = csv.writer(f)
                 if self.resolved_info:
-                    writer.writerow(["Subdomain", "IPs", "CNAMEs", "HTTP", "HTTPS", "Title", "Server", "Alive"])
+                    writer.writerow(["Subdomain", "IPs", "IPv6s", "CNAMEs", "HTTP", "HTTPS", "Title", "Server", "Technologies", "Takeover", "TakeoverService", "Alive"])
                     for sub in sorted(self.resolved_info.keys()):
                         info = self.resolved_info[sub]
                         writer.writerow([
                             info.subdomain,
                             "|".join(info.ips),
+                            "|".join(info.ipv6s),
                             "|".join(info.cnames),
                             info.http_status or "",
                             info.https_status or "",
                             info.title or "",
                             info.http_server or "",
+                            "|".join(info.technologies),
+                            info.takeover_vulnerable,
+                            info.takeover_service or "",
                             info.is_alive,
                         ])
                 else:
@@ -516,6 +546,9 @@ class SubdomainX:
             "censys": "CENSYS_API_KEY",  # format: id:secret
             "binaryedge": "BINARYEDGE_API_KEY",
             "chaos": "CHAOS_API_KEY",
+            "bevigil": "BEVIGIL_API_KEY",
+            "whoisxmlapi": "WHOISXMLAPI_KEY",
+            "zoomeye": "ZOOMEYE_API_KEY",
         }
         for source, env_var in env_map.items():
             val = os.environ.get(env_var, "")
@@ -550,12 +583,14 @@ Examples:
   python -m subdomainx example.com
   python -m subdomainx example.com -o results.txt
   python -m subdomainx example.com --probe --permutations --recursive -o results.json
+  python -m subdomainx example.com --deep -o results.json
   python -m subdomainx example.com --no-bruteforce --probe -o results.csv
   python -m subdomainx example.com -w custom_wordlist.txt -t 1000
 
 API Keys (set via environment variables or ~/.subdomainx/config.json):
   VIRUSTOTAL_API_KEY, SECURITYTRAILS_API_KEY, SHODAN_API_KEY,
-  CENSYS_API_KEY (format: id:secret), BINARYEDGE_API_KEY, CHAOS_API_KEY
+  CENSYS_API_KEY (format: id:secret), BINARYEDGE_API_KEY, CHAOS_API_KEY,
+  BEVIGIL_API_KEY, WHOISXMLAPI_KEY, ZOOMEYE_API_KEY
         """,
     )
 
@@ -576,6 +611,8 @@ API Keys (set via environment variables or ~/.subdomainx/config.json):
                         help="Probe HTTP/HTTPS and resolve DNS for all results")
     parser.add_argument("--all", action="store_true",
                         help="Enable all techniques (permutations + recursive + probe)")
+    parser.add_argument("--deep", action="store_true",
+                        help="Deep mode: all techniques + higher concurrency + expanded sources")
     parser.add_argument("-v", "--version", action="version",
                         version=f"SubdomainX {__version__}")
 
@@ -586,6 +623,15 @@ API Keys (set via environment variables or ~/.subdomainx/config.json):
         args.permutations = True
         args.recursive = True
         args.probe = True
+
+    # --deep enables everything + cranks up settings
+    if args.deep:
+        args.permutations = True
+        args.recursive = True
+        args.probe = True
+        args.recursive_depth = max(args.recursive_depth, 3)
+        if args.concurrency == 500:  # Only override if user didn't set it
+            args.concurrency = 1000
 
     # Validate domain
     domain = args.domain.lower().strip()

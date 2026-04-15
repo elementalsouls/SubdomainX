@@ -125,11 +125,14 @@ class DNSBruteForcer:
         """Create multiple resolver instances for load balancing."""
         # Public DNS servers for high-throughput resolution
         dns_servers = [
-            ["8.8.8.8", "8.8.4.4"],          # Google
-            ["1.1.1.1", "1.0.0.1"],          # Cloudflare
-            ["9.9.9.9", "149.112.112.112"],  # Quad9
-            ["208.67.222.222", "208.67.220.220"],  # OpenDNS
-            ["64.6.64.6", "64.6.65.6"],      # Verisign
+            ["8.8.8.8", "8.8.4.4"],                    # Google
+            ["1.1.1.1", "1.0.0.1"],                    # Cloudflare
+            ["9.9.9.9", "149.112.112.112"],             # Quad9
+            ["208.67.222.222", "208.67.220.220"],       # OpenDNS
+            ["64.6.64.6", "64.6.65.6"],                # Verisign
+            ["185.228.168.9", "185.228.169.9"],         # CleanBrowsing
+            ["76.76.19.19", "76.223.122.150"],          # Alternate DNS
+            ["94.140.14.14", "94.140.15.15"],           # AdGuard DNS
         ]
         for servers in dns_servers:
             r = dns.asyncresolver.Resolver()
@@ -142,19 +145,52 @@ class DNSBruteForcer:
         return random.choice(self._resolvers)
 
     async def _resolve_one(self, subdomain: str, semaphore: asyncio.Semaphore) -> Optional[str]:
-        """Resolve a single subdomain."""
+        """Resolve a single subdomain. Checks A, AAAA, and CNAME records."""
         fqdn = f"{subdomain}.{self.domain}"
         async with semaphore:
+            # Try A record first
             resolver = self._get_resolver()
             try:
                 answers = await resolver.resolve(fqdn, "A")
                 ips = {rdata.address for rdata in answers}
                 if not self.wildcard.is_wildcard(ips):
                     return fqdn
-            except (dns.asyncresolver.NXDOMAIN, dns.asyncresolver.NoAnswer,
-                    dns.asyncresolver.NoNameservers, asyncio.TimeoutError,
-                    dns.exception.Timeout, Exception):
+            except (dns.asyncresolver.NXDOMAIN, dns.asyncresolver.NoNameservers):
+                return None
+            except (dns.asyncresolver.NoAnswer,):
+                pass  # No A record, try AAAA/CNAME below
+            except (asyncio.TimeoutError, dns.exception.Timeout):
+                # Retry once with different resolver on timeout
+                try:
+                    resolver = self._get_resolver()
+                    answers = await resolver.resolve(fqdn, "A")
+                    ips = {rdata.address for rdata in answers}
+                    if not self.wildcard.is_wildcard(ips):
+                        return fqdn
+                except Exception:
+                    pass
+                return None
+            except Exception:
+                return None
+
+            # Try AAAA record
+            try:
+                resolver = self._get_resolver()
+                answers = await resolver.resolve(fqdn, "AAAA")
+                if answers:
+                    return fqdn
+            except Exception:
                 pass
+
+            # Try CNAME record (some subdomains only have CNAMEs)
+            try:
+                resolver = self._get_resolver()
+                answers = await resolver.resolve(fqdn, "CNAME")
+                if answers:
+                    return fqdn
+            except Exception:
+                pass
+
         return None
 
     def _load_wordlist(self) -> List[str]:
@@ -227,7 +263,7 @@ class PermutationScanner:
             self._resolvers.append(r)
 
     def _generate_permutations(self) -> Set[str]:
-        """Generate permutations of discovered subdomains."""
+        """Generate comprehensive permutations of discovered subdomains."""
         permutations = set()
 
         # Extract subdomain parts (without the base domain)
@@ -237,26 +273,127 @@ class PermutationScanner:
             if prefix:
                 parts.add(prefix)
 
-        # Common prefixes/suffixes to combine
-        affixes = [
-            "dev", "staging", "stage", "stg", "test", "testing", "qa",
-            "uat", "prod", "production", "pre", "preprod", "demo",
-            "beta", "alpha", "v1", "v2", "v3", "api", "app", "web",
-            "www", "mail", "email", "admin", "portal", "internal",
-            "external", "public", "private", "new", "old", "backup",
-            "bak", "temp", "tmp", "dr", "sandbox", "lab",
-            "1", "2", "3", "01", "02", "03",
+        # Environment / lifecycle
+        env_affixes = [
+            "dev", "development", "staging", "stage", "stg", "test", "testing",
+            "qa", "uat", "prod", "production", "pre", "preprod", "demo", "beta",
+            "alpha", "gamma", "v1", "v2", "v3", "v4", "canary", "preview",
+            "release", "rc", "nightly", "edge", "next", "legacy", "stable",
+            "sandbox", "lab", "pilot", "trial", "perf", "loadtest", "stress",
+            "pen", "pentest", "sec", "security", "audit",
         ]
 
+        # Infrastructure / services
+        infra_affixes = [
+            "api", "app", "web", "www", "mail", "email", "smtp", "imap", "pop",
+            "ftp", "sftp", "ssh", "vpn", "proxy", "gateway", "gw", "lb",
+            "loadbalancer", "cdn", "cache", "redis", "memcached", "queue",
+            "mq", "rabbit", "kafka", "elastic", "es", "kibana", "grafana",
+            "prometheus", "monitor", "monitoring", "log", "logs", "logging",
+            "syslog", "metrics", "status", "health", "admin", "portal",
+            "dashboard", "panel", "cms", "blog", "shop", "store", "pay",
+            "payment", "checkout", "cart", "auth", "login", "sso", "oauth",
+            "id", "identity", "iam", "ldap", "ad", "directory", "dns",
+            "ns", "ns1", "ns2", "mx", "relay", "git", "gitlab", "github",
+            "bitbucket", "ci", "cd", "jenkins", "drone", "bamboo", "build",
+            "deploy", "release", "artifact", "registry", "docker", "k8s",
+            "kube", "kubernetes", "container", "swarm", "consul", "vault",
+            "terraform", "ansible", "puppet", "chef",
+        ]
+
+        # Cloud / hosting
+        cloud_affixes = [
+            "aws", "azure", "gcp", "cloud", "s3", "ec2", "lambda", "ecs",
+            "eks", "rds", "dynamodb", "sqs", "sns", "cf", "cloudfront",
+            "cdn", "storage", "blob", "bucket", "func", "function",
+            "compute", "vm", "vps", "host", "server", "node", "cluster",
+            "instance", "origin",
+        ]
+
+        # Geographic / regional
+        geo_affixes = [
+            "us", "eu", "ap", "asia", "na", "sa", "africa", "oceania",
+            "us-east", "us-west", "eu-west", "eu-central", "ap-south",
+            "ap-northeast", "us1", "us2", "eu1", "eu2", "ap1",
+            "east", "west", "north", "south", "central",
+            "ny", "sf", "la", "chi", "dal", "lon", "fra", "sin", "syd",
+            "tok", "mum", "hk", "sg",
+        ]
+
+        # Access patterns
+        access_affixes = [
+            "internal", "external", "public", "private", "corp", "corporate",
+            "intranet", "extranet", "partner", "vendor", "client", "customer",
+            "employee", "staff", "hr", "finance", "legal", "engineering",
+            "support", "helpdesk", "ticket", "jira", "confluence", "wiki",
+            "docs", "documentation", "kb", "knowledge",
+        ]
+
+        # State / backup
+        state_affixes = [
+            "new", "old", "backup", "bak", "bkp", "temp", "tmp", "dr",
+            "disaster", "recovery", "failover", "standby", "replica",
+            "mirror", "secondary", "primary", "master", "slave", "main",
+            "archive", "archived", "deprecated", "retired",
+        ]
+
+        # Numbers
+        number_affixes = [
+            "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
+            "01", "02", "03", "04", "05", "06", "07", "08", "09",
+            "001", "002", "003",
+        ]
+
+        # Database / data
+        data_affixes = [
+            "db", "database", "mysql", "postgres", "postgresql", "mongo",
+            "mongodb", "mssql", "sql", "oracle", "cassandra", "couchdb",
+            "neo4j", "influx", "clickhouse", "data", "dw", "warehouse",
+            "etl", "hadoop", "spark", "airflow", "nifi",
+        ]
+
+        all_affixes = (
+            env_affixes + infra_affixes + cloud_affixes + geo_affixes +
+            access_affixes + state_affixes + number_affixes + data_affixes
+        )
+
         for part in parts:
-            for affix in affixes:
-                # prefix-word, word-prefix
+            for affix in all_affixes:
+                # Hyphenated
                 permutations.add(f"{affix}-{part}")
                 permutations.add(f"{part}-{affix}")
+                # Concatenated
                 permutations.add(f"{affix}{part}")
                 permutations.add(f"{part}{affix}")
+                # Dot-separated (sub-subdomain)
                 permutations.add(f"{affix}.{part}")
                 permutations.add(f"{part}.{affix}")
+
+            # Word splitting permutations — if part contains hyphen, try swaps
+            if "-" in part:
+                segments = part.split("-")
+                if len(segments) == 2:
+                    # Swap order
+                    permutations.add(f"{segments[1]}-{segments[0]}")
+                    # Try with dots instead
+                    permutations.add(f"{segments[0]}.{segments[1]}")
+                    permutations.add(f"{segments[1]}.{segments[0]}")
+
+            # Number suffix/prefix additions
+            for n in range(1, 11):
+                permutations.add(f"{part}{n}")
+                permutations.add(f"{part}-{n}")
+                permutations.add(f"{n}-{part}")
+                permutations.add(f"{n}{part}")
+
+        # Cross-combine found parts (e.g., api+mail, dev+shop)
+        parts_list = list(parts)[:50]  # Limit to avoid explosion
+        for i, p1 in enumerate(parts_list):
+            for p2 in parts_list[i+1:]:
+                permutations.add(f"{p1}-{p2}")
+                permutations.add(f"{p2}-{p1}")
+                permutations.add(f"{p1}.{p2}")
+                permutations.add(f"{p2}.{p1}")
 
         # Remove already-known subdomains
         known_prefixes = {sub.replace(f".{self.domain}", "") for sub in self.found}
