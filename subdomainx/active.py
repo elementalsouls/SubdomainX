@@ -24,51 +24,92 @@ from .mutations import generate_mutations, STATIC_AFFIXES, DEFAULT_MAX_MUTATIONS
 
 
 class WildcardDetector:
-    """Detects wildcard DNS records to avoid false positives."""
+    """Detects wildcard DNS to avoid false positives — apex AND per-parent, and
+    CNAME-wildcard aware. One instance is reused across phases (a per-parent cache
+    means each parent is probed once, not once per phase or per candidate)."""
 
     def __init__(self, domain: str):
         self.domain = domain
         self.wildcard_ips: Set[str] = set()
+        self.wildcard_cnames: Set[str] = set()
         self.has_wildcard = False
+        # parent -> (has_wildcard, ip_set, cname_set)
+        self._cache: dict = {}
 
-    async def detect(self):
-        """Check if the domain has wildcard DNS by querying random subdomains."""
+    async def _probe(self, parent: str):
+        """Query several random labels under *parent* for A + CNAME. Returns the
+        per-probe ip-sets and cname-sets."""
         resolver = dns.asyncresolver.Resolver()
         resolver.timeout = 5
         resolver.lifetime = 5
-
-        random_subs = [
-            "".join(random.choices(string.ascii_lowercase + string.digits, k=16))
-            for _ in range(5)
-        ]
-
-        wildcard_ips = []
-        for sub in random_subs:
-            fqdn = f"{sub}.{self.domain}"
+        ip_sets: List[Set[str]] = []
+        cname_sets: List[Set[str]] = []
+        for _ in range(5):
+            sub = "".join(random.choices(string.ascii_lowercase + string.digits, k=16))
+            fqdn = f"{sub}.{parent}"
+            ips: Set[str] = set()
+            cnames: Set[str] = set()
             try:
-                answers = await resolver.resolve(fqdn, "A")
-                ips = {rdata.address for rdata in answers}
-                wildcard_ips.append(ips)
+                for rdata in await resolver.resolve(fqdn, "A"):
+                    ips.add(rdata.address)
             except Exception:
-                wildcard_ips.append(set())
+                pass
+            try:
+                for rdata in await resolver.resolve(fqdn, "CNAME"):
+                    cnames.add(str(rdata.target).rstrip("."))
+            except Exception:
+                pass
+            ip_sets.append(ips)
+            cname_sets.append(cnames)
+        return ip_sets, cname_sets
 
-        # If all random subdomains resolve to the same IPs, it's a wildcard
-        non_empty = [s for s in wildcard_ips if s]
-        if len(non_empty) >= 3:
-            common = non_empty[0]
-            for s in non_empty[1:]:
-                common = common & s
-            if common:
-                self.has_wildcard = True
-                self.wildcard_ips = common
+    @staticmethod
+    def _common(sets: List[Set[str]]) -> Set[str]:
+        non_empty = [s for s in sets if s]
+        if len(non_empty) < 3:
+            return set()
+        common = set(non_empty[0])
+        for s in non_empty[1:]:
+            common &= s
+        return common
 
+    async def detect_parent(self, parent: str):
+        """Per-parent wildcard detection (cached). Returns
+        ``(has_wildcard, ip_set, cname_set)`` for *parent*."""
+        if parent in self._cache:
+            return self._cache[parent]
+        ip_sets, cname_sets = await self._probe(parent)
+        common_ips = self._common(ip_sets)
+        common_cnames = self._common(cname_sets)
+        result = (bool(common_ips or common_cnames), common_ips, common_cnames)
+        self._cache[parent] = result
+        return result
+
+    async def detect(self):
+        """Detect the apex wildcard (back-compat entry point). Populates
+        ``has_wildcard`` / ``wildcard_ips`` / ``wildcard_cnames``."""
+        has, ips, cnames = await self.detect_parent(self.domain)
+        self.has_wildcard = has
+        self.wildcard_ips = ips
+        self.wildcard_cnames = cnames
         return self.has_wildcard, self.wildcard_ips
 
-    def is_wildcard(self, ips: Set[str]) -> bool:
-        """Check if a set of IPs matches the wildcard response."""
-        if not self.has_wildcard:
-            return False
-        return bool(ips & self.wildcard_ips)
+    def is_wildcard(self, ips: Set[str], cnames: Optional[Set[str]] = None) -> bool:
+        """True if the answer matches the (apex) wildcard — by IP or, when the
+        wildcard is a CNAME wildcard, by CNAME target."""
+        if self.has_wildcard and ips and (set(ips) & self.wildcard_ips):
+            return True
+        if cnames and self.wildcard_cnames and (set(cnames) & self.wildcard_cnames):
+            return True
+        return False
+
+    @staticmethod
+    def is_junk(name: str) -> bool:
+        """Drop PTR-like / excessive-digit names (e.g. ``10-20-30-40.example.com``)
+        before they enter the mutation corpus or results."""
+        from .mutations import has_excessive_digits
+        label = (name or "").split(".")[0].lower()
+        return not label or has_excessive_digits(label)
 
 
 class ZoneTransfer:

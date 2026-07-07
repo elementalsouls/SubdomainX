@@ -251,10 +251,13 @@ class SubdomainX:
 
         console.print(f"  [dim]Using wordlist: {wordlist} ({word_count:,} words)[/]")
 
-        # Wildcard detection
+        # Wildcard detection — one shared detector reused across all phases.
         console.print("  [dim]Checking for wildcard DNS...[/]")
-        wc = WildcardDetector(self.domain)
-        has_wildcard, wc_ips = await wc.detect()
+        if self._shared_wildcard is None:
+            self._shared_wildcard = WildcardDetector(self.domain)
+            await self._shared_wildcard.detect()
+        wc = self._shared_wildcard
+        has_wildcard, wc_ips = wc.has_wildcard, wc.wildcard_ips
         if has_wildcard:
             console.print(f"  [yellow]⚠ Wildcard detected: {', '.join(wc_ips)} — filtering enabled[/]")
         else:
@@ -330,8 +333,10 @@ class SubdomainX:
         """Permutation / alteration scanning."""
         console.print("\n[bold yellow]▶ Phase 4: Permutation Scanning[/]")
 
-        wc = WildcardDetector(self.domain)
-        await wc.detect()
+        if self._shared_wildcard is None:
+            self._shared_wildcard = WildcardDetector(self.domain)
+            await self._shared_wildcard.detect()
+        wc = self._shared_wildcard
 
         scanner = PermutationScanner(
             self.domain, self.all_subdomains.copy(), wc,
