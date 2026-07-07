@@ -20,6 +20,8 @@ import dns.query
 import dns.name
 import dns.rdatatype
 
+from .mutations import generate_mutations, STATIC_AFFIXES, DEFAULT_MAX_MUTATIONS
+
 
 class WildcardDetector:
     """Detects wildcard DNS records to avoid false positives."""
@@ -321,143 +323,18 @@ class PermutationScanner:
             self._resolvers.append(r)
 
     def _generate_permutations(self) -> Set[str]:
-        """Generate comprehensive permutations of discovered subdomains."""
-        permutations = set()
-
-        # Extract subdomain parts (without the base domain)
-        parts = set()
-        for sub in self.found:
-            prefix = sub.replace(f".{self.domain}", "")
-            if prefix:
-                parts.add(prefix)
-
-        # Environment / lifecycle
-        env_affixes = [
-            "dev", "development", "staging", "stage", "stg", "test", "testing",
-            "qa", "uat", "prod", "production", "pre", "preprod", "demo", "beta",
-            "alpha", "gamma", "v1", "v2", "v3", "v4", "canary", "preview",
-            "release", "rc", "nightly", "edge", "next", "legacy", "stable",
-            "sandbox", "lab", "pilot", "trial", "perf", "loadtest", "stress",
-            "pen", "pentest", "sec", "security", "audit",
-        ]
-
-        # Infrastructure / services
-        infra_affixes = [
-            "api", "app", "web", "www", "mail", "email", "smtp", "imap", "pop",
-            "ftp", "sftp", "ssh", "vpn", "proxy", "gateway", "gw", "lb",
-            "loadbalancer", "cdn", "cache", "redis", "memcached", "queue",
-            "mq", "rabbit", "kafka", "elastic", "es", "kibana", "grafana",
-            "prometheus", "monitor", "monitoring", "log", "logs", "logging",
-            "syslog", "metrics", "status", "health", "admin", "portal",
-            "dashboard", "panel", "cms", "blog", "shop", "store", "pay",
-            "payment", "checkout", "cart", "auth", "login", "sso", "oauth",
-            "id", "identity", "iam", "ldap", "ad", "directory", "dns",
-            "ns", "ns1", "ns2", "mx", "relay", "git", "gitlab", "github",
-            "bitbucket", "ci", "cd", "jenkins", "drone", "bamboo", "build",
-            "deploy", "release", "artifact", "registry", "docker", "k8s",
-            "kube", "kubernetes", "container", "swarm", "consul", "vault",
-            "terraform", "ansible", "puppet", "chef",
-        ]
-
-        # Cloud / hosting
-        cloud_affixes = [
-            "aws", "azure", "gcp", "cloud", "s3", "ec2", "lambda", "ecs",
-            "eks", "rds", "dynamodb", "sqs", "sns", "cf", "cloudfront",
-            "cdn", "storage", "blob", "bucket", "func", "function",
-            "compute", "vm", "vps", "host", "server", "node", "cluster",
-            "instance", "origin",
-        ]
-
-        # Geographic / regional
-        geo_affixes = [
-            "us", "eu", "ap", "asia", "na", "sa", "africa", "oceania",
-            "us-east", "us-west", "eu-west", "eu-central", "ap-south",
-            "ap-northeast", "us1", "us2", "eu1", "eu2", "ap1",
-            "east", "west", "north", "south", "central",
-            "ny", "sf", "la", "chi", "dal", "lon", "fra", "sin", "syd",
-            "tok", "mum", "hk", "sg",
-        ]
-
-        # Access patterns
-        access_affixes = [
-            "internal", "external", "public", "private", "corp", "corporate",
-            "intranet", "extranet", "partner", "vendor", "client", "customer",
-            "employee", "staff", "hr", "finance", "legal", "engineering",
-            "support", "helpdesk", "ticket", "jira", "confluence", "wiki",
-            "docs", "documentation", "kb", "knowledge",
-        ]
-
-        # State / backup
-        state_affixes = [
-            "new", "old", "backup", "bak", "bkp", "temp", "tmp", "dr",
-            "disaster", "recovery", "failover", "standby", "replica",
-            "mirror", "secondary", "primary", "master", "slave", "main",
-            "archive", "archived", "deprecated", "retired",
-        ]
-
-        # Numbers
-        number_affixes = [
-            "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
-            "01", "02", "03", "04", "05", "06", "07", "08", "09",
-            "001", "002", "003",
-        ]
-
-        # Database / data
-        data_affixes = [
-            "db", "database", "mysql", "postgres", "postgresql", "mongo",
-            "mongodb", "mssql", "sql", "oracle", "cassandra", "couchdb",
-            "neo4j", "influx", "clickhouse", "data", "dw", "warehouse",
-            "etl", "hadoop", "spark", "airflow", "nifi",
-        ]
-
-        all_affixes = (
-            env_affixes + infra_affixes + cloud_affixes + geo_affixes +
-            access_affixes + state_affixes + number_affixes + data_affixes
+        """Generate permutations of discovered subdomains via the target-learned
+        mutation engine ([2]): a frequency word cloud of the target's own naming
+        tokens, recombined across every parent + a static affix seed set, deduped
+        (optionally against a shared bloom for loop-until-dry). Signature preserved
+        — the Falcon adapter and the phase loop call this unchanged."""
+        return generate_mutations(
+            self.found,
+            self.domain,
+            static_affixes=STATIC_AFFIXES,
+            max_mutations=getattr(self, "max_mutations", DEFAULT_MAX_MUTATIONS),
+            bloom=getattr(self, "_bloom", None),
         )
-
-        for part in parts:
-            for affix in all_affixes:
-                # Hyphenated
-                permutations.add(f"{affix}-{part}")
-                permutations.add(f"{part}-{affix}")
-                # Concatenated
-                permutations.add(f"{affix}{part}")
-                permutations.add(f"{part}{affix}")
-                # Dot-separated (sub-subdomain)
-                permutations.add(f"{affix}.{part}")
-                permutations.add(f"{part}.{affix}")
-
-            # Word splitting permutations — if part contains hyphen, try swaps
-            if "-" in part:
-                segments = part.split("-")
-                if len(segments) == 2:
-                    # Swap order
-                    permutations.add(f"{segments[1]}-{segments[0]}")
-                    # Try with dots instead
-                    permutations.add(f"{segments[0]}.{segments[1]}")
-                    permutations.add(f"{segments[1]}.{segments[0]}")
-
-            # Number suffix/prefix additions
-            for n in range(1, 11):
-                permutations.add(f"{part}{n}")
-                permutations.add(f"{part}-{n}")
-                permutations.add(f"{n}-{part}")
-                permutations.add(f"{n}{part}")
-
-        # Cross-combine found parts (e.g., api+mail, dev+shop)
-        parts_list = list(parts)[:50]  # Limit to avoid explosion
-        for i, p1 in enumerate(parts_list):
-            for p2 in parts_list[i+1:]:
-                permutations.add(f"{p1}-{p2}")
-                permutations.add(f"{p2}-{p1}")
-                permutations.add(f"{p1}.{p2}")
-                permutations.add(f"{p2}.{p1}")
-
-        # Remove already-known subdomains
-        known_prefixes = {sub.replace(f".{self.domain}", "") for sub in self.found}
-        permutations -= known_prefixes
-
-        return permutations
 
     async def _resolve_one(self, prefix: str, semaphore: asyncio.Semaphore) -> Optional[str]:
         fqdn = f"{prefix}.{self.domain}"
