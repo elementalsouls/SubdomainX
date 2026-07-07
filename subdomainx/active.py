@@ -379,53 +379,87 @@ class RecursiveEnumerator:
         self.max_depth = max_depth
         self.callback = callback
         self.results: Set[str] = set()
+        # [3] optional shared massdns backend (attr-injected, like the other
+        # scanners) + a per-parent wildcard cache so we detect each base's
+        # wildcard once, not once per candidate.
+        self.resolver_backend = None
+        self._wc_cache: dict = {}
+
+    def _prefix_depth(self, fqdn: str) -> int:
+        """Number of labels between *fqdn* and the base domain (1 == direct sub)."""
+        prefix = fqdn[: -len(self.domain) - 1] if fqdn.endswith("." + self.domain) else ""
+        return len([p for p in prefix.split(".") if p]) if prefix else 0
+
+    async def _wildcard_for(self, base: str) -> WildcardDetector:
+        wc = self._wc_cache.get(base)
+        if wc is None:
+            wc = WildcardDetector(base)
+            try:
+                await wc.detect()
+            except Exception:
+                pass
+            self._wc_cache[base] = wc
+        return wc
 
     async def enumerate(self) -> Set[str]:
-        """Run recursive brute force against discovered subdomains."""
-        # Only recurse on subdomains that are one level deep
-        candidates = set()
-        for sub in self.found:
-            prefix = sub.replace(f".{self.domain}", "")
-            parts = prefix.split(".")
-            if len(parts) == 1 and parts[0]:
-                candidates.add(sub)
-
-        # Use a smaller wordlist for recursive enumeration
-        small_words = self._load_small_wordlist()
-        if not small_words or not candidates:
+        """Recursively brute the wordlist under discovered subdomains, honoring
+        ``max_depth`` (breadth-first: each newly-found deeper name becomes a base
+        for the next level, up to max_depth). Uses the shared resolver backend
+        when attached, else per-name dnspython."""
+        words = self._load_small_wordlist()
+        if not words:
             return self.results
 
-        for base_sub in candidates:
-            wc = WildcardDetector(base_sub)
-            await wc.detect()
-
-            semaphore = asyncio.Semaphore(self.concurrency)
-            tasks = []
-            for word in small_words:
-                fqdn = f"{word}.{base_sub}"
-                tasks.append(self._resolve(fqdn, wc, semaphore))
-
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for result in results:
-                if isinstance(result, str) and result:
-                    self.results.add(result)
-                    if self.callback:
-                        self.callback(result)
-
+        # Level-1 frontier: the directly-under-apex names we already know.
+        frontier = {s for s in self.found if self._prefix_depth(s) == 1}
+        depth = 1
+        while frontier and depth <= self.max_depth:
+            next_frontier: Set[str] = set()
+            for base in sorted(frontier):
+                wc = await self._wildcard_for(base)
+                hits = await self._resolve_words_under(base, words, wc)
+                for h in hits:
+                    if h not in self.results:
+                        self.results.add(h)
+                        if self.callback:
+                            self.callback(h)
+                        next_frontier.add(h)
+            frontier = next_frontier
+            depth += 1
         return self.results
 
+    async def _resolve_words_under(self, base: str, words: List[str],
+                                   wc: WildcardDetector) -> Set[str]:
+        """Resolve ``<word>.<base>`` for every word — massdns backend in one bulk
+        pass when attached, else per-name dnspython."""
+        backend = getattr(self, "resolver_backend", None)
+        fqdns = [f"{w}.{base}" for w in words]
+        if backend is not None and getattr(backend, "binary", None):
+            wc_ips = wc.wildcard_ips if getattr(wc, "has_wildcard", False) else set()
+            records = await backend.resolve(fqdns, wildcard_ips=wc_ips)
+            return set(records.keys())
+        semaphore = asyncio.Semaphore(self.concurrency)
+        tasks = [self._resolve(fqdn, wc, semaphore) for fqdn in fqdns]
+        hits: Set[str] = set()
+        for r in await asyncio.gather(*tasks, return_exceptions=True):
+            if isinstance(r, str) and r:
+                hits.add(r)
+        return hits
+
     def _load_small_wordlist(self) -> List[str]:
-        """Load a subset of the wordlist for recursive enumeration."""
+        """Load a subset of the wordlist for recursive enumeration. Size is
+        configurable via the ``max_recursive_words`` attr (default 500)."""
         path = Path(self.wordlist_path)
         if not path.exists():
             return []
+        limit = getattr(self, "max_recursive_words", 500)
         words = []
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 word = line.strip().lower()
                 if word and not word.startswith("#"):
                     words.append(word)
-                if len(words) >= 500:  # Limit for recursive
+                if len(words) >= limit:
                     break
         return words
 

@@ -26,6 +26,7 @@ from .passive import FREE_SOURCES, API_SOURCES
 from .active import WildcardDetector, ZoneTransfer, DNSBruteForcer, PermutationScanner, RecursiveEnumerator
 from .resolver import SubdomainResolver, SubdomainInfo
 from .resolver_massdns import MassdnsResolver, select_backend
+from .mutations import BloomFilter, DEFAULT_MAX_MUTATIONS
 
 console = Console()
 
@@ -63,6 +64,9 @@ class SubdomainX:
             getattr(config, "resolver_backend", "auto"), MassdnsResolver.detect())
         self._massdns = (MassdnsResolver()
                          if self.resolver_backend_name == "massdns" else None)
+        # [4] one wildcard detector reused across phases (set lazily by the first
+        # phase that needs it). [3] convergence reuses it too.
+        self._shared_wildcard = None
         self.start_time = 0.0
 
     def add_seed_subdomains(self, names) -> int:
@@ -131,6 +135,10 @@ class SubdomainX:
         # Phase 5: Recursive Enumeration
         if self.config.recursive:
             await self._recursive_phase()
+
+        # Phase 5b: Loop-until-dry mutation convergence (self-contained)
+        if self.config.permutations and int(getattr(self.config, "mutation_rounds", 3) or 0) > 0:
+            await self._convergence_phase()
 
         # Phase 6: Resolve & Probe
         if self.config.probe:
@@ -379,62 +387,103 @@ class SubdomainX:
         console.print("\n[bold yellow]▶ Phase 5: Recursive Enumeration[/]")
 
         wordlist = self.config.wordlist or str(DEFAULT_WORDLIST)
-        wc = WildcardDetector(self.domain)
-        await wc.detect()
+        wc = self._shared_wildcard
+        if wc is None:
+            wc = WildcardDetector(self.domain)
+            await wc.detect()
+            self._shared_wildcard = wc
 
         recursive = RecursiveEnumerator(
             self.domain, self.all_subdomains.copy(), wordlist, wc,
             concurrency=self.config.concurrency,
             max_depth=self.config.recursive_depth,
         )
+        recursive.resolver_backend = self._massdns  # [1] shared bulk backend
+        recursive.max_recursive_words = getattr(self.config, "max_recursive_words", 500)
 
-        # Identify candidates for recursive enumeration
-        candidates = set()
-        for sub in self.all_subdomains:
-            prefix = sub.replace(f".{self.domain}", "")
-            parts = prefix.split(".")
-            if len(parts) == 1 and parts[0]:
-                candidates.add(sub)
-
+        candidates = {s for s in self.all_subdomains if recursive._prefix_depth(s) == 1}
         small_words = recursive._load_small_wordlist()
-        total_checks = len(candidates) * len(small_words)
-        console.print(f"  [dim]Recursing into {len(candidates)} subdomains × {len(small_words)} words = {total_checks:,} checks[/]")
+        console.print(
+            f"  [dim]Recursing into {len(candidates)} base subdomain(s) × "
+            f"{len(small_words)} words, breadth-first to depth ≤ {recursive.max_depth}[/]"
+        )
+
+        def _cb(hit):
+            console.print(f"    [green]+[/] {hit}")
+        recursive.callback = _cb
 
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TextColumn("[green]{task.fields[found]}[/] found"),
             console=console,
-            refresh_per_second=4,
         ) as progress:
-            task = progress.add_task(
-                "[cyan]Recursive enumeration...", total=total_checks, found=0
-            )
-
-            for base_sub in candidates:
-                sub_wc = WildcardDetector(base_sub)
-                await sub_wc.detect()
-
-                semaphore = asyncio.Semaphore(recursive.concurrency)
-                batch_size = 200
-                for i in range(0, len(small_words), batch_size):
-                    batch = small_words[i : i + batch_size]
-                    tasks_batch = [recursive._resolve(f"{w}.{base_sub}", sub_wc, semaphore) for w in batch]
-                    results_batch = await asyncio.gather(*tasks_batch, return_exceptions=True)
-                    for result in results_batch:
-                        if isinstance(result, str) and result:
-                            recursive.results.add(result)
-                            console.print(f"    [green]+[/] {result}")
-                    progress.update(task, advance=len(batch), found=len(recursive.results))
-
-            results = recursive.results
+            progress.add_task("[cyan]Recursive enumeration (BFS)...", total=None)
+            # RecursiveEnumerator.enumerate() honors max_depth (each new deeper
+            # name becomes a base for the next level) and uses the shared backend.
+            results = await recursive.enumerate()
 
         before = len(self.all_subdomains)
         self.all_subdomains.update(results)
         new = len(self.all_subdomains) - before
         console.print(f"  [bold]→ Recursive: {len(results)} resolved, {new} new unique[/]")
+
+    async def _convergence_phase(self):
+        """[3] Loop-until-dry mutation convergence. After the standard phases,
+        repeatedly rebuild the mutation word cloud from ALL known names and
+        re-run the permutation engine. A bloom shared across rounds guarantees
+        no known/attempted name is re-emitted, so each round only tests genuinely
+        new candidates. Stops after ``mutation_rounds`` consecutive empty rounds
+        (default 3) or a hard round cap. Self-contained — no orchestrator re-feed."""
+        console.print("\n[bold yellow]▶ Phase 5b: Loop-until-dry mutation convergence[/]")
+        rounds = int(getattr(self.config, "mutation_rounds", 3) or 0)
+        if rounds <= 0:
+            console.print("  [dim]○ Convergence disabled (mutation_rounds=0)[/]")
+            return
+        max_rounds = 12  # hard backstop against pathological expansion
+
+        wc = self._shared_wildcard
+        if wc is None:
+            wc = WildcardDetector(self.domain)
+            try:
+                await wc.detect()
+            except Exception:
+                pass
+            self._shared_wildcard = wc
+
+        # Seed the cross-round bloom with every known prefix so it is never re-tried.
+        bloom = BloomFilter(capacity=2_000_000)
+        suffix = "." + self.domain
+        for s in self.all_subdomains:
+            pfx = s[: -len(suffix)] if s.endswith(suffix) else ""
+            if pfx:
+                bloom.add(pfx)
+
+        empty = 0
+        rnd = 0
+        while empty < rounds and rnd < max_rounds:
+            rnd += 1
+            new = await self._mutation_round(wc, bloom)
+            if new > 0:
+                empty = 0
+                console.print(f"  [green]round {rnd}: +{new} new (total {len(self.all_subdomains)})[/]")
+            else:
+                empty += 1
+        console.print(f"  [bold]→ Convergence: {rnd} round(s), dry after {empty} empty[/]")
+
+    async def _mutation_round(self, wc, bloom) -> int:
+        """One convergence round: mutate from all known names, resolve, ingest.
+        Returns the count of genuinely-new names found this round."""
+        scanner = PermutationScanner(
+            self.domain, self.all_subdomains.copy(), wc,
+            concurrency=self.config.concurrency,
+        )
+        scanner.resolver_backend = self._massdns
+        scanner._bloom = bloom  # cross-round dedupe, read by _generate_permutations
+        scanner.max_mutations = getattr(self.config, "max_mutations", None) or DEFAULT_MAX_MUTATIONS
+        before = len(self.all_subdomains)
+        results = await scanner.scan()
+        self.all_subdomains.update(results)
+        return len(self.all_subdomains) - before
 
     async def _resolve_phase(self):
         """Resolve all found subdomains and probe HTTP."""
@@ -673,6 +722,9 @@ API Keys (set via environment variables or ~/.subdomainx/config.json):
                         help="Enable recursive subdomain enumeration")
     parser.add_argument("--recursive-depth", type=int, default=2,
                         help="Recursion depth (default: 2)")
+    parser.add_argument("--mutation-rounds", type=int, default=3,
+                        help="Loop-until-dry: stop after N consecutive empty mutation "
+                             "rounds (default: 3; 0 disables convergence)")
     parser.add_argument("--probe", action="store_true",
                         help="Probe HTTP/HTTPS and resolve DNS for all results")
     parser.add_argument("--all", action="store_true",
