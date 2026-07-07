@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "subdomainx"
+version = "2.0.0"
+description = "Comprehensive subdomain enumeration — passive OSINT + active DNS + smart brute-force"
+requires-python = ">=3.11"
+dependencies = [
+  "aiohttp>=3.9.0",
+  "aiodns>=3.1.0",
+  "dnspython>=2.4.0",
+  "requests>=2.31.0",
+  "beautifulsoup4>=4.12.0",
+  "rich>=13.7.0",
+  "tqdm>=4.66.0",
+]
+
+[project.scripts]
+subdomainx = "subdomainx.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["subdomainx"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"wordlists" = "subdomainx/wordlists"
+
+[tool.pytest.ini_options]
+markers = [
+  "live: hits real DNS — opt-in only. Run with SUBDOMAINX_LIVE=1 (or -m live). Skipped by default so the offline suite stays hermetic.",
+]
