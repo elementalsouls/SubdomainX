@@ -9,6 +9,14 @@ names/signatures the Falcon adapter monkeypatches/reads are preserved.
 
 ### Added
 
+- **Numbered-sequence enumeration in the mutation engine.** A known name ending
+  in a number (`esec01`, `sales2`, `shreemail04`) implies the whole sequence, but
+  the per-parent numeric padding only appended to the *full* token (`esec01` →
+  `esec011`), so `esec02`/`esec03` were never tried when passive knew only some
+  members. `generate_mutations` now recovers the digit-less stem (`_number_stem`:
+  `esec01` → `esec`) and emits the bare stem + a wide numbered range (`esec`,
+  `esec1..esec12`, `esec01..esec09`, hyphenated too). Classic ASM pattern — found
+  `esec01,esec02`, obviously try `esec03+`. `tests/test_mutations_sequence.py`.
 - **[0] External seed ingestion** — `SubdomainX.add_seed_subdomains(names)`
   pre-populates `all_subdomains` + a dedicated `seed_subdomains` set (normalized,
   scope-filtered) before the active phases, so the mutation engine learns from

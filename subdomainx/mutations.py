@@ -41,6 +41,18 @@ STATIC_AFFIXES: List[str] = [
 
 _NUMERIC_PAD: List[str] = ["1", "2", "3", "0", "01", "02", "03"]
 
+# Sequence enumeration: when a known name ends in a number (esec01, sales2,
+# shreemail04), an attacker enumerates the whole sequence (esec02, esec03, …).
+# A wider pad set is used for the *stem* than the generic per-parent padding,
+# because a numbered host is a strong signal that siblings exist.
+_SEQ_PAD: List[str] = (
+    [str(i) for i in range(1, 10)]            # 1..9
+    + ["0" + str(i) for i in range(1, 10)]    # 01..09
+    + ["10", "11", "12"]
+)
+# Trailing-number splitter: "esec01" -> ("esec", "01"), "sales-2" -> ("sales", "2").
+_TRAIL_NUM_RE = re.compile(r"^(.*?)[-_]?(\d+)$")
+
 DEFAULT_MAX_MUTATIONS = 100_000
 
 
@@ -58,6 +70,19 @@ def has_excessive_digits(token: str) -> bool:
     if digits / len(token) > 0.6:     # mostly digits
         return True
     return False
+
+
+def _number_stem(prefix: str) -> Optional[str]:
+    """If *prefix* ends in a number, return its digit-less stem so the sequence
+    can be enumerated. ``esec01`` -> ``esec``, ``sales-2`` -> ``sales``. Returns
+    None when there is no trailing number or the stem is too short / all digits."""
+    m = _TRAIL_NUM_RE.match(prefix)
+    if not m:
+        return None
+    stem = m.group(1)
+    if len(stem) < 2 or stem.isdigit():
+        return None
+    return stem
 
 
 def _strip_domain(name: str, domain: str) -> str:
@@ -192,4 +217,16 @@ def generate_mutations(
                 _emit(cand)
                 if len(out) >= max_mutations:
                     return out
+        # Sequence enumeration — a numbered parent (esec01, sales2) implies the
+        # whole sequence. Recover the stem and emit the bare stem + the wider
+        # numbered range (esec, esec02, esec03, …), the pattern the per-parent
+        # padding above misses because it only appends to the FULL token.
+        stem = _number_stem(parent)
+        if stem:
+            _emit(stem)
+            for pad in _SEQ_PAD:
+                for cand in (f"{stem}{pad}", f"{stem}-{pad}"):
+                    _emit(cand)
+                    if len(out) >= max_mutations:
+                        return out
     return out
