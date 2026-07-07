@@ -275,6 +275,7 @@ class SubdomainX:
             callback=on_found
         )
         bruter.resolver_backend = self._massdns  # [1] massdns bulk path when available
+        bruter.resolver_validation = bool(getattr(self.config, "resolver_validation", True))  # [5]
 
         # Load words to track progress
         with open(wordlist, "r", encoding="utf-8", errors="ignore") as f:
@@ -343,6 +344,7 @@ class SubdomainX:
             concurrency=self.config.concurrency
         )
         scanner.resolver_backend = self._massdns  # [1] massdns bulk path when available
+        scanner.resolver_validation = bool(getattr(self.config, "resolver_validation", True))  # [5]
 
         perms = scanner._generate_permutations()
         console.print(f"  [dim]Generated {len(perms):,} permutations from {len(self.all_subdomains)} discovered subdomains[/]")
@@ -404,6 +406,7 @@ class SubdomainX:
             max_depth=self.config.recursive_depth,
         )
         recursive.resolver_backend = self._massdns  # [1] shared bulk backend
+        recursive.resolver_validation = bool(getattr(self.config, "resolver_validation", True))  # [5]
         recursive.max_recursive_words = getattr(self.config, "max_recursive_words", 500)
 
         candidates = {s for s in self.all_subdomains if recursive._prefix_depth(s) == 1}
@@ -483,6 +486,7 @@ class SubdomainX:
             concurrency=self.config.concurrency,
         )
         scanner.resolver_backend = self._massdns
+        scanner.resolver_validation = bool(getattr(self.config, "resolver_validation", True))  # [5]
         scanner._bloom = bloom  # cross-round dedupe, read by _generate_permutations
         scanner.max_mutations = getattr(self.config, "max_mutations", None) or DEFAULT_MAX_MUTATIONS
         before = len(self.all_subdomains)
@@ -730,6 +734,10 @@ API Keys (set via environment variables or ~/.subdomainx/config.json):
     parser.add_argument("--mutation-rounds", type=int, default=3,
                         help="Loop-until-dry: stop after N consecutive empty mutation "
                              "rounds (default: 3; 0 disables convergence)")
+    parser.add_argument("--no-resolver-validation", dest="resolver_validation",
+                        action="store_false", default=True,
+                        help="Skip re-verifying each hit on a trusted resolver set "
+                             "(validation is ON by default; guards against poisoning)")
     parser.add_argument("--probe", action="store_true",
                         help="Probe HTTP/HTTPS and resolve DNS for all results")
     parser.add_argument("--all", action="store_true",

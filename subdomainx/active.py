@@ -21,6 +21,7 @@ import dns.name
 import dns.rdatatype
 
 from .mutations import generate_mutations, STATIC_AFFIXES, DEFAULT_MAX_MUTATIONS
+from .validation import maybe_verify
 
 
 class WildcardDetector:
@@ -165,8 +166,17 @@ class DNSBruteForcer:
         # dnspython via _resolve_one. Attr-injected (like max_words) so the frozen
         # __init__ signature the Falcon adapter monkeypatches stays intact.
         self.resolver_backend = None
+        # [5] trust tier: re-verify hits on trusted resolvers before accepting.
+        # Off by default at this layer (opt-in) — the CLI/adapter turn it on.
+        self.resolver_validation = False
+        self._verifier = None
         self._resolvers: List[dns.asyncresolver.Resolver] = []
         self._setup_resolvers()
+
+    async def _accept(self, fqdn: str) -> Optional[str]:
+        """[5] Gate a fast-path hit through trusted re-verification (no-op when
+        resolver_validation is off). Returns the fqdn if accepted, else None."""
+        return fqdn if fqdn in (await maybe_verify(self, {fqdn})) else None
 
     async def bulk_resolve(self, words) -> Set[str]:
         """Resolve candidate *words* (subdomain prefixes) against ``self.domain``.
@@ -184,13 +194,15 @@ class DNSBruteForcer:
                       if getattr(self.wildcard, "has_wildcard", False) else set())
             fqdns = [f"{w}.{self.domain}" for w in words]
             records = await backend.resolve(fqdns, wildcard_ips=wc_ips)
-            hits = set(records.keys())
+            # [5] massdns bypasses _resolve_one, so re-verify the bulk hits here.
+            hits = await maybe_verify(self, set(records.keys()))
             for h in hits:
                 self.results.add(h)
                 if self.callback:
                     self.callback(h)
             return hits
-        # dnspython fallback — per-name, honours the (possibly patched) _resolve_one
+        # dnspython fallback — per-name, honours the (possibly patched) _resolve_one,
+        # which already applies trust-tier verification via _accept().
         semaphore = asyncio.Semaphore(self.concurrency)
         tasks = [self._resolve_one(w, semaphore) for w in words]
         hits: Set[str] = set()
@@ -237,7 +249,7 @@ class DNSBruteForcer:
                 answers = await resolver.resolve(fqdn, "A")
                 ips = {rdata.address for rdata in answers}
                 if not self.wildcard.is_wildcard(ips):
-                    return fqdn
+                    return await self._accept(fqdn)
             except (dns.asyncresolver.NXDOMAIN, dns.asyncresolver.NoNameservers):
                 return None
             except (dns.asyncresolver.NoAnswer,):
@@ -254,7 +266,7 @@ class DNSBruteForcer:
                 resolver = self._get_resolver()
                 answers = await resolver.resolve(fqdn, "AAAA")
                 if answers:
-                    return fqdn
+                    return await self._accept(fqdn)
             except Exception:
                 pass
 
@@ -263,7 +275,7 @@ class DNSBruteForcer:
                 resolver = self._get_resolver()
                 answers = await resolver.resolve(fqdn, "CNAME")
                 if answers:
-                    return fqdn
+                    return await self._accept(fqdn)
             except Exception:
                 pass
 
@@ -316,8 +328,14 @@ class PermutationScanner:
         self.callback = callback
         self.results: Set[str] = set()
         self.resolver_backend = None  # optional MassdnsResolver; None => dnspython
+        self.resolver_validation = False  # [5] trust-tier re-verification (opt-in)
+        self._verifier = None
         self._resolvers: List[dns.asyncresolver.Resolver] = []
         self._setup_resolvers()
+
+    async def _accept(self, fqdn: str) -> Optional[str]:
+        """[5] Trusted re-verification gate (no-op when resolver_validation off)."""
+        return fqdn if fqdn in (await maybe_verify(self, {fqdn})) else None
 
     async def bulk_resolve(self, prefixes) -> Set[str]:
         """Resolve permutation *prefixes* against ``self.domain`` — massdns backend
@@ -331,7 +349,7 @@ class PermutationScanner:
                       if getattr(self.wildcard, "has_wildcard", False) else set())
             fqdns = [f"{p}.{self.domain}" for p in prefixes]
             records = await backend.resolve(fqdns, wildcard_ips=wc_ips)
-            hits = set(records.keys())
+            hits = await maybe_verify(self, set(records.keys()))  # [5] re-verify bulk hits
             for h in hits:
                 self.results.add(h)
                 if self.callback:
@@ -385,7 +403,7 @@ class PermutationScanner:
                 answers = await resolver.resolve(fqdn, "A")
                 ips = {rdata.address for rdata in answers}
                 if not self.wildcard.is_wildcard(ips):
-                    return fqdn
+                    return await self._accept(fqdn)
             except Exception:
                 pass
         return None
@@ -424,6 +442,8 @@ class RecursiveEnumerator:
         # scanners) + a per-parent wildcard cache so we detect each base's
         # wildcard once, not once per candidate.
         self.resolver_backend = None
+        self.resolver_validation = False  # [5] trust-tier re-verification (opt-in)
+        self._verifier = None
         self._wc_cache: dict = {}
 
     def _prefix_depth(self, fqdn: str) -> int:
@@ -478,14 +498,16 @@ class RecursiveEnumerator:
         if backend is not None and getattr(backend, "binary", None):
             wc_ips = wc.wildcard_ips if getattr(wc, "has_wildcard", False) else set()
             records = await backend.resolve(fqdns, wildcard_ips=wc_ips)
-            return set(records.keys())
-        semaphore = asyncio.Semaphore(self.concurrency)
-        tasks = [self._resolve(fqdn, wc, semaphore) for fqdn in fqdns]
-        hits: Set[str] = set()
-        for r in await asyncio.gather(*tasks, return_exceptions=True):
-            if isinstance(r, str) and r:
-                hits.add(r)
-        return hits
+            raw = set(records.keys())
+        else:
+            semaphore = asyncio.Semaphore(self.concurrency)
+            tasks = [self._resolve(fqdn, wc, semaphore) for fqdn in fqdns]
+            raw = set()
+            for r in await asyncio.gather(*tasks, return_exceptions=True):
+                if isinstance(r, str) and r:
+                    raw.add(r)
+        # [5] re-verify hits on trusted resolvers before accepting them as bases.
+        return await maybe_verify(self, raw)
 
     def _load_small_wordlist(self) -> List[str]:
         """Load a subset of the wordlist for recursive enumeration. Size is

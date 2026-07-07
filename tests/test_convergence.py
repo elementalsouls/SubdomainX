@@ -32,6 +32,7 @@ class FakeBackend:
 
 def _sx(domain="example.com", **cfg):
     cfg.setdefault("concurrency", 10)
+    cfg.setdefault("resolver_validation", False)  # offline: no trusted re-verify DNS
     ns = argparse.Namespace(domain=domain, **cfg)
     sx = SubdomainX(ns)
     sx._shared_wildcard = WildcardDetector(domain)  # no-wildcard, avoids network detect
