@@ -118,8 +118,48 @@ class DNSBruteForcer:
         self.concurrency = concurrency
         self.callback = callback
         self.results: Set[str] = set()
+        # Optional bulk resolver backend (a MassdnsResolver). None => per-name
+        # dnspython via _resolve_one. Attr-injected (like max_words) so the frozen
+        # __init__ signature the Falcon adapter monkeypatches stays intact.
+        self.resolver_backend = None
         self._resolvers: List[dns.asyncresolver.Resolver] = []
         self._setup_resolvers()
+
+    async def bulk_resolve(self, words) -> Set[str]:
+        """Resolve candidate *words* (subdomain prefixes) against ``self.domain``.
+
+        Uses the attached massdns backend for a single bulk pass when present +
+        usable; otherwise falls back to per-name dnspython through ``_resolve_one``
+        (which the Falcon adapter patches for live progress). Adds every hit to
+        ``self.results`` and fires ``self.callback``."""
+        words = [w for w in words if w]
+        if not words:
+            return set()
+        backend = getattr(self, "resolver_backend", None)
+        if backend is not None and getattr(backend, "binary", None):
+            wc_ips = (self.wildcard.wildcard_ips
+                      if getattr(self.wildcard, "has_wildcard", False) else set())
+            fqdns = [f"{w}.{self.domain}" for w in words]
+            records = await backend.resolve(fqdns, wildcard_ips=wc_ips)
+            hits = set(records.keys())
+            for h in hits:
+                self.results.add(h)
+                if self.callback:
+                    self.callback(h)
+            return hits
+        # dnspython fallback — per-name, honours the (possibly patched) _resolve_one
+        semaphore = asyncio.Semaphore(self.concurrency)
+        tasks = [self._resolve_one(w, semaphore) for w in words]
+        hits: Set[str] = set()
+        for i in range(0, len(tasks), 1000):
+            batch = tasks[i:i + 1000]
+            for r in await asyncio.gather(*batch, return_exceptions=True):
+                if isinstance(r, str) and r:
+                    hits.add(r)
+                    self.results.add(r)
+                    if self.callback:
+                        self.callback(r)
+        return hits
 
     def _setup_resolvers(self):
         """Create multiple resolver instances for load balancing."""
@@ -137,8 +177,8 @@ class DNSBruteForcer:
         for servers in dns_servers:
             r = dns.asyncresolver.Resolver()
             r.nameservers = servers
-            r.timeout = 3
-            r.lifetime = 5
+            r.timeout = 1.5
+            r.lifetime = 2.5
             self._resolvers.append(r)
 
     def _get_resolver(self) -> dns.asyncresolver.Resolver:
@@ -160,20 +200,13 @@ class DNSBruteForcer:
             except (dns.asyncresolver.NoAnswer,):
                 pass  # No A record, try AAAA/CNAME below
             except (asyncio.TimeoutError, dns.exception.Timeout):
-                # Retry once with different resolver on timeout
-                try:
-                    resolver = self._get_resolver()
-                    answers = await resolver.resolve(fqdn, "A")
-                    ips = {rdata.address for rdata in answers}
-                    if not self.wildcard.is_wildcard(ips):
-                        return fqdn
-                except Exception:
-                    pass
+                # A record timeout — don't chase AAAA/CNAME, just bail. Saves ~5s per
+                # failing word, which is the common case on bruteforce.
                 return None
             except Exception:
                 return None
 
-            # Try AAAA record
+            # Try AAAA (only if A returned NoAnswer — i.e. the label exists but has no IPv4)
             try:
                 resolver = self._get_resolver()
                 answers = await resolver.resolve(fqdn, "AAAA")
@@ -182,7 +215,7 @@ class DNSBruteForcer:
             except Exception:
                 pass
 
-            # Try CNAME record (some subdomains only have CNAMEs)
+            # Try CNAME (IPv6-only rare; CNAME-only common for SaaS aliases)
             try:
                 resolver = self._get_resolver()
                 answers = await resolver.resolve(fqdn, "CNAME")
@@ -194,7 +227,11 @@ class DNSBruteForcer:
         return None
 
     def _load_wordlist(self) -> List[str]:
-        """Load subdomain wordlist from file."""
+        """Load subdomain wordlist from file.
+
+        If self.max_words is set, only the first N words are returned (wordlists are
+        ordered by frequency/popularity, so top-N gives the best hit rate per second).
+        """
         words = []
         path = Path(self.wordlist_path)
         if not path.exists():
@@ -204,28 +241,17 @@ class DNSBruteForcer:
                 word = line.strip().lower()
                 if word and not word.startswith("#"):
                     words.append(word)
+        max_words = getattr(self, "max_words", None)
+        if max_words and len(words) > max_words:
+            words = words[:max_words]
         return words
 
     async def brute_force(self) -> Set[str]:
-        """Run DNS brute force against the wordlist."""
+        """Run DNS brute force against the wordlist (via the resolver backend)."""
         words = self._load_wordlist()
         if not words:
             return self.results
-
-        semaphore = asyncio.Semaphore(self.concurrency)
-        tasks = [self._resolve_one(word, semaphore) for word in words]
-
-        # Process in batches for progress tracking
-        batch_size = 1000
-        for i in range(0, len(tasks), batch_size):
-            batch = tasks[i : i + batch_size]
-            results = await asyncio.gather(*batch, return_exceptions=True)
-            for result in results:
-                if isinstance(result, str) and result:
-                    self.results.add(result)
-                    if self.callback:
-                        self.callback(result)
-
+        await self.bulk_resolve(words)
         return self.results
 
 
@@ -246,8 +272,40 @@ class PermutationScanner:
         self.concurrency = concurrency
         self.callback = callback
         self.results: Set[str] = set()
+        self.resolver_backend = None  # optional MassdnsResolver; None => dnspython
         self._resolvers: List[dns.asyncresolver.Resolver] = []
         self._setup_resolvers()
+
+    async def bulk_resolve(self, prefixes) -> Set[str]:
+        """Resolve permutation *prefixes* against ``self.domain`` — massdns backend
+        when attached + usable, else per-name dnspython via ``_resolve_one``."""
+        prefixes = [p for p in prefixes if p]
+        if not prefixes:
+            return set()
+        backend = getattr(self, "resolver_backend", None)
+        if backend is not None and getattr(backend, "binary", None):
+            wc_ips = (self.wildcard.wildcard_ips
+                      if getattr(self.wildcard, "has_wildcard", False) else set())
+            fqdns = [f"{p}.{self.domain}" for p in prefixes]
+            records = await backend.resolve(fqdns, wildcard_ips=wc_ips)
+            hits = set(records.keys())
+            for h in hits:
+                self.results.add(h)
+                if self.callback:
+                    self.callback(h)
+            return hits
+        semaphore = asyncio.Semaphore(self.concurrency)
+        tasks = [self._resolve_one(p, semaphore) for p in prefixes]
+        hits: Set[str] = set()
+        for i in range(0, len(tasks), 1000):
+            batch = tasks[i:i + 1000]
+            for r in await asyncio.gather(*batch, return_exceptions=True):
+                if isinstance(r, str) and r:
+                    hits.add(r)
+                    self.results.add(r)
+                    if self.callback:
+                        self.callback(r)
+        return hits
 
     def _setup_resolvers(self):
         dns_servers = [
@@ -258,8 +316,8 @@ class PermutationScanner:
         for servers in dns_servers:
             r = dns.asyncresolver.Resolver()
             r.nameservers = servers
-            r.timeout = 3
-            r.lifetime = 5
+            r.timeout = 1.5
+            r.lifetime = 2.5
             self._resolvers.append(r)
 
     def _generate_permutations(self) -> Set[str]:
@@ -419,20 +477,7 @@ class PermutationScanner:
         perms = self._generate_permutations()
         if not perms:
             return self.results
-
-        semaphore = asyncio.Semaphore(self.concurrency)
-        tasks = [self._resolve_one(p, semaphore) for p in perms]
-
-        batch_size = 1000
-        for i in range(0, len(tasks), batch_size):
-            batch = tasks[i : i + batch_size]
-            results = await asyncio.gather(*batch, return_exceptions=True)
-            for result in results:
-                if isinstance(result, str) and result:
-                    self.results.add(result)
-                    if self.callback:
-                        self.callback(result)
-
+        await self.bulk_resolve(perms)
         return self.results
 
 

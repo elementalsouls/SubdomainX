@@ -25,6 +25,7 @@ from . import __version__
 from .passive import FREE_SOURCES, API_SOURCES
 from .active import WildcardDetector, ZoneTransfer, DNSBruteForcer, PermutationScanner, RecursiveEnumerator
 from .resolver import SubdomainResolver, SubdomainInfo
+from .resolver_massdns import MassdnsResolver, select_backend
 
 console = Console()
 
@@ -54,6 +55,14 @@ class SubdomainX:
         # results). Kept as a dedicated set so the mutation engine can learn from
         # them even after all_subdomains grows. Empty by default (standalone CLI).
         self.seed_subdomains: Set[str] = set()
+        # [1] Resolver backend selection. "auto" uses massdns when the binary is
+        # present (huge bulk-resolution speedup), else dnspython. On Windows the
+        # binary is typically absent so this stays dnspython — the speed win comes
+        # from the native path, not from raising async-DNS concurrency on win32.
+        self.resolver_backend_name = select_backend(
+            getattr(config, "resolver_backend", "auto"), MassdnsResolver.detect())
+        self._massdns = (MassdnsResolver()
+                         if self.resolver_backend_name == "massdns" else None)
         self.start_time = 0.0
 
     def add_seed_subdomains(self, names) -> int:
@@ -254,6 +263,7 @@ class SubdomainX:
             concurrency=self.config.concurrency,
             callback=on_found
         )
+        bruter.resolver_backend = self._massdns  # [1] massdns bulk path when available
 
         # Load words to track progress
         with open(wordlist, "r", encoding="utf-8", errors="ignore") as f:
@@ -278,6 +288,15 @@ class SubdomainX:
             async def brute_with_progress():
                 words = bruter._load_wordlist()
                 if not words:
+                    return bruter.results
+                # [1] massdns bulk path — one fast pass over the whole wordlist.
+                if bruter.resolver_backend is not None:
+                    before = len(bruter.results)
+                    hits = await bruter.bulk_resolve(words)
+                    for h in sorted(hits):
+                        console.print(f"    [green]+[/] {h}")
+                    progress.update(task, advance=len(words), found=len(bruter.results))
+                    _ = before
                     return bruter.results
                 semaphore = asyncio.Semaphore(bruter.concurrency)
                 batch_size = 500
@@ -310,6 +329,7 @@ class SubdomainX:
             self.domain, self.all_subdomains.copy(), wc,
             concurrency=self.config.concurrency
         )
+        scanner.resolver_backend = self._massdns  # [1] massdns bulk path when available
 
         perms = scanner._generate_permutations()
         console.print(f"  [dim]Generated {len(perms):,} permutations from {len(self.all_subdomains)} discovered subdomains[/]")
@@ -328,17 +348,24 @@ class SubdomainX:
             )
 
             perm_list = list(perms)
-            semaphore = asyncio.Semaphore(scanner.concurrency)
-            batch_size = 500
-            for i in range(0, len(perm_list), batch_size):
-                batch = perm_list[i : i + batch_size]
-                tasks_batch = [scanner._resolve_one(p, semaphore) for p in batch]
-                results_batch = await asyncio.gather(*tasks_batch, return_exceptions=True)
-                for result in results_batch:
-                    if isinstance(result, str) and result:
-                        scanner.results.add(result)
-                        console.print(f"    [green]+[/] {result}")
-                progress.update(task, advance=len(batch), found=len(scanner.results))
+            # [1] massdns bulk path — one fast pass over all permutations.
+            if scanner.resolver_backend is not None:
+                hits = await scanner.bulk_resolve(perm_list)
+                for h in sorted(hits):
+                    console.print(f"    [green]+[/] {h}")
+                progress.update(task, advance=len(perm_list), found=len(scanner.results))
+            else:
+                semaphore = asyncio.Semaphore(scanner.concurrency)
+                batch_size = 500
+                for i in range(0, len(perm_list), batch_size):
+                    batch = perm_list[i : i + batch_size]
+                    tasks_batch = [scanner._resolve_one(p, semaphore) for p in batch]
+                    results_batch = await asyncio.gather(*tasks_batch, return_exceptions=True)
+                    for result in results_batch:
+                        if isinstance(result, str) and result:
+                            scanner.results.add(result)
+                            console.print(f"    [green]+[/] {result}")
+                    progress.update(task, advance=len(batch), found=len(scanner.results))
 
             results = scanner.results
 
@@ -634,6 +661,10 @@ API Keys (set via environment variables or ~/.subdomainx/config.json):
     parser.add_argument("-w", "--wordlist", help="Custom wordlist for brute forcing")
     parser.add_argument("-t", "--concurrency", type=int, default=500,
                         help="Concurrent DNS queries (default: 500)")
+    parser.add_argument("--resolver-backend", choices=["auto", "massdns", "dnspython"],
+                        default="auto",
+                        help="Bulk resolver backend: auto (massdns if installed, else "
+                             "dnspython), massdns, or dnspython (default: auto)")
     parser.add_argument("--no-bruteforce", action="store_true",
                         help="Skip DNS brute forcing (passive only)")
     parser.add_argument("--permutations", action="store_true",
