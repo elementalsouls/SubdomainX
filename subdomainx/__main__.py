@@ -50,7 +50,42 @@ class SubdomainX:
         self.all_subdomains: Set[str] = set()
         self.resolved_info: Dict[str, SubdomainInfo] = {}
         self.source_counts: Dict[str, int] = {}
+        # Externally-supplied seed names (e.g. Falcon's stage-1 CT/pDNS/dns_deep
+        # results). Kept as a dedicated set so the mutation engine can learn from
+        # them even after all_subdomains grows. Empty by default (standalone CLI).
+        self.seed_subdomains: Set[str] = set()
         self.start_time = 0.0
+
+    def add_seed_subdomains(self, names) -> int:
+        """Pre-seed enumeration with externally-discovered names (before the active
+        phases run). They pre-populate ``all_subdomains`` AND ``seed_subdomains`` so
+        the mutation/word-cloud engine learns from them without SubdomainX re-querying
+        any passive source. Names are normalized (lower/strip/trailing-dot) and kept
+        only if in scope for ``self.domain`` (the apex itself or a subdomain of it).
+
+        Seedless-safe: ``None``/empty is a no-op. Returns the count of genuinely-new
+        names added to ``all_subdomains``."""
+        if not names:
+            return 0
+        suffix = "." + self.domain
+        added = 0
+        for raw in names:
+            if not isinstance(raw, str):
+                continue
+            name = raw.strip().lower().rstrip(".")
+            if not name:
+                continue
+            # In-scope only: the apex itself or a real subdomain of it. The
+            # trailing-dot suffix check rejects the "example.com.evil.com" trick.
+            if name != self.domain and not name.endswith(suffix):
+                continue
+            self.seed_subdomains.add(name)
+            if name not in self.all_subdomains:
+                self.all_subdomains.add(name)
+                added += 1
+        if added:
+            self.source_counts["seed"] = self.source_counts.get("seed", 0) + added
+        return added
 
     async def run(self):
         """Execute the full enumeration pipeline."""
