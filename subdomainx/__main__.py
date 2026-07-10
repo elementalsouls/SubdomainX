@@ -140,8 +140,14 @@ class SubdomainX:
         if self.config.permutations and int(getattr(self.config, "mutation_rounds", 3) or 0) > 0:
             await self._convergence_phase()
 
-        # Phase 6: Resolve & Probe
-        if self.config.probe:
+        # Phase 6: DNS Resolution (+ HTTP probe when enabled).
+        # Gated on ``resolve_names`` (default: follow ``probe`` for standalone use)
+        # so an embedder that owns HTTP probing can set ``probe=False`` to stop us
+        # duplicating HTTP work while STILL getting DNS resolution — without it,
+        # passive-discovered non-HTTP hosts never get an IP. The HTTP half of this
+        # phase is separately gated by ``SubdomainResolver(check_http=self.config.probe)``,
+        # so with ``probe=False`` this is a pure DNS-resolution pass.
+        if getattr(self.config, "resolve_names", self.config.probe):
             await self._resolve_phase()
 
         # Results
