@@ -29,6 +29,13 @@ class WildcardDetector:
     CNAME-wildcard aware. One instance is reused across phases (a per-parent cache
     means each parent is probed once, not once per phase or per candidate)."""
 
+    # Explicit public resolvers — the wildcard probe must NOT use the system
+    # config: some corporate/ISP resolvers don't answer direct dnspython UDP, so
+    # a system-configured resolver times out on every probe, stalling wildcard
+    # detection and starving active resolution. The bruteforce pool already uses
+    # explicit nameservers; keep the detector consistent with it.
+    _PUBLIC_NAMESERVERS = ["1.1.1.1", "8.8.8.8", "9.9.9.9", "149.112.112.112"]
+
     def __init__(self, domain: str):
         self.domain = domain
         self.wildcard_ips: Set[str] = set()
@@ -36,13 +43,15 @@ class WildcardDetector:
         self.has_wildcard = False
         # parent -> (has_wildcard, ip_set, cname_set)
         self._cache: dict = {}
+        self._resolver = dns.asyncresolver.Resolver(configure=False)
+        self._resolver.nameservers = list(self._PUBLIC_NAMESERVERS)
+        self._resolver.timeout = 5
+        self._resolver.lifetime = 5
 
     async def _probe(self, parent: str):
         """Query several random labels under *parent* for A + CNAME. Returns the
         per-probe ip-sets and cname-sets."""
-        resolver = dns.asyncresolver.Resolver()
-        resolver.timeout = 5
-        resolver.lifetime = 5
+        resolver = self._resolver
         ip_sets: List[Set[str]] = []
         cname_sets: List[Set[str]] = []
         for _ in range(5):

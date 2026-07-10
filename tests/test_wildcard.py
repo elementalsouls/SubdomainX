@@ -17,6 +17,22 @@ def _stub_probe(wd, ip_sets, cname_sets, counter=None):
     wd._probe = _p
 
 
+# ── resolver must not depend on (possibly unreachable) system DNS ─────────────
+
+def test_wildcard_resolver_uses_explicit_public_nameservers():
+    """The wildcard probe must use explicit public resolvers, NOT the system
+    config. Some corporate/ISP resolvers do not answer direct dnspython UDP, so a
+    system-configured resolver times out on every probe — which made wildcard
+    detection stall and starved active subdomain resolution (Falcon jakson.com
+    run: 66 subdomains, 0 resolved). The bruteforce pool already sets explicit
+    nameservers; the wildcard detector must too."""
+    wd = WildcardDetector("example.com")
+    ns = wd._resolver.nameservers
+    assert ns, "wildcard resolver has no explicit nameservers (would use system DNS)"
+    assert all(not str(n).startswith(("127.", "0.")) for n in ns)
+    assert any(str(n) in ("1.1.1.1", "8.8.8.8", "9.9.9.9") for n in ns)
+
+
 # ── per-parent cache ─────────────────────────────────────────────────────────
 
 def test_detect_parent_caches_and_probes_once():
